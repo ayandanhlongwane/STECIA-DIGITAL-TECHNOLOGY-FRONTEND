@@ -1,0 +1,93 @@
+# Runs on the self-hosted runner on the VPS (user gh-runner, docker group).
+#
+# Every push and pull request: build the site image to check it builds.
+# Pushes to main (or a manual run on main): deploy with Docker Compose.
+#
+# Configuration (Settings > Secrets and variables > Actions > Variables):
+#   PUBLIC_HOST - the VPS IP or host name, e.g. 13.140.213.149
+#   SITE_PORT   - optional host port for the site (default 5000)
+
+name: CI and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: self-hosted
+    timeout-minutes: 15
+    env:
+      IMAGE: stecia-frontend-ci:${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build image
+        run: docker build -t "$IMAGE" .
+
+      - name: Smoke test
+        run: |
+          cid=$(docker run -d --rm "$IMAGE")
+          trap 'docker stop "$cid" >/dev/null' EXIT
+          for _ in $(seq 1 10); do
+            if docker exec "$cid" wget -qO- http://localhost/ | grep -qi '<html'; then
+              echo "Site serves index.html"; exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Container did not serve index.html"
+          docker logs "$cid" || true
+          exit 1
+
+      - name: Remove CI image
+        if: always()
+        run: docker image rm -f "$IMAGE" || true
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: self-hosted
+    timeout-minutes: 15
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      PUBLIC_HOST: ${{ vars.PUBLIC_HOST }}
+      SITE_PORT: ${{ vars.SITE_PORT || '5000' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check configuration
+        run: |
+          if [ -z "$PUBLIC_HOST" ]; then
+            echo "::error::Set the repository variable PUBLIC_HOST (Settings > Secrets and variables > Actions > Variables) to the VPS IP."
+            exit 1
+          fi
+
+      - name: Deploy site
+        run: docker compose -p stecia-frontend up -d --build --remove-orphans
+
+      - name: Wait for the site to respond
+        run: |
+          url="http://localhost:${SITE_PORT}/"
+          for _ in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || true)
+            case "$code" in 2*|3*) echo "$url -> $code"; echo "Live at http://${PUBLIC_HOST}:${SITE_PORT}/"; exit 0;; esac
+            sleep 2
+          done
+          echo "::error::$url did not respond (last status: ${code:-none})"
+          docker compose -p stecia-frontend logs --tail 80 || true
+          exit 1
+
+      - name: Clean up old images
+        if: always()
+        run: docker image prune -f

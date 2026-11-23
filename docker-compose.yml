@@ -1,0 +1,7 @@
+services:
+  web:
+    build: .
+    image: stecia-frontend:latest
+    restart: unless-stopped
+    ports:
+      - "${SITE_PORT:-5000}:80"
